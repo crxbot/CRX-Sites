@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Alle DWD-Einzelstandorte: laden -> nach uint8-dBZ wandeln -> gzip -> R2 + metadata.json je Standort.
+"""Alle DWD-Einzelstandorte: laden -> uint8-dBZ -> gzip -> R2 (nur das jeweils neueste Bild).
 
 R2-Layout:
-    regenradar-sites/<code>/metadata.json
-    regenradar-sites/<code>/dbz_<code>_<YYYYMMDD>_<HHMM>      (gzip, max. MAX_KEEP Stueck, UTC)
+    sites/radar/metadata.json            (alle Radare: status, timestamp, grid)
+    sites/radar/dbz_<code>_latest        (gzip, wird pro Lauf ueberschrieben)
+
+status:  ok           Datei geladen, gewandelt, hochgeladen
+         unavailable  DWD hat die Datei nicht geliefert (404 bis Timeout) -> altes Bild + alter timestamp bleiben
+         invalid      Datei kaputt / nicht lesbar / fast nur "kein Datum" -> altes Bild + alter timestamp bleiben
 
 Aufruf:  python scripts/sites_radar.py            (alle Standorte aus scripts/sites.json)
-         python scripts/sites_radar.py umd mem    (nur diese)
+         python scripts/sites_radar.py umd mem    (nur diese; die anderen Eintraege bleiben unveraendert)
 """
 import gzip
 import json
@@ -29,9 +33,11 @@ import site_native as sn  # liegt im selben Ordner (scripts/)
 
 BASE_URL = "https://opendata.dwd.de/weather/radar/sites/lmax"
 R2_PREFIX = os.environ.get("SITES_R2_PREFIX", "sites/radar")
-MAX_KEEP = int(os.environ.get("SITES_MAX_KEEP", "6"))
-WAIT_SECONDS = int(os.environ.get("SITES_WAIT_SECONDS", "360"))
+WAIT_SECONDS = int(os.environ.get("SITES_WAIT_SECONDS", "180"))          # wartet auf die Datei
+RETRY_WAIT_SECONDS = int(os.environ.get("SITES_RETRY_WAIT_SECONDS", "20"))  # bei Radaren, die zuletzt nicht ok waren
+MAX_NODATA = float(os.environ.get("SITES_MAX_NODATA", "0.97"))           # Anteil Code 255, ab dem das Bild "invalid" ist
 SITES_FILE = Path(__file__).with_name("sites.json")
+CACHE = "public, max-age=30"
 
 
 def convert(path: Path):
@@ -78,10 +84,12 @@ def convert(path: Path):
     return codes, grid
 
 
-def download(site: dict, slot: datetime, dest: Path, deadline: float) -> None:
+def download(site: dict, slot: datetime, dest: Path, wait: int) -> None:
+    """Laedt die Slot-Datei; 404 -> alle 5 s erneut, bis `wait` Sekunden um sind (dann TimeoutError)."""
     stamp = slot.strftime("%Y%m%d%H%M%S")
     name = f"rab02-lm_{site['wmo']}-{stamp}-de{site['code']}-hd5"
     url = f"{BASE_URL}/{site['code']}/{name}"
+    deadline = time.time() + wait
     attempt = 0
     while True:
         attempt += 1
@@ -102,7 +110,7 @@ def download(site: dict, slot: datetime, dest: Path, deadline: float) -> None:
         time.sleep(5)
 
 
-def get_existing(s3, bucket: str, key: str) -> dict:
+def get_json(s3, bucket: str, key: str) -> dict:
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
@@ -114,68 +122,47 @@ def get_existing(s3, bucket: str, key: str) -> dict:
         return {}
 
 
-def process_site(s3, bucket: str, site: dict, slot: datetime, deadline: float) -> str:
+def process_site(s3, bucket: str, site: dict, slot: datetime, wait: int) -> dict:
+    """Gibt das Update fuer den Meta-Eintrag zurueck: {"status": ..., (nur bei ok:) "timestamp", "grid"}."""
     code = site["code"]
     ts = slot.strftime("%Y%m%d_%H%M")
-    prefix = f"{R2_PREFIX}/{code}"
 
-    with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / "in.hd5"
-        download(site, slot, src, deadline)
-        codes, grid = convert(src)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.hd5"
+            download(site, slot, src, wait)
+            codes, grid = convert(src)
+    except TimeoutError as e:
+        print(f"[{code}] unavailable: {e}")
+        return {"status": "unavailable"}
+    except Exception as e:
+        print(f"[{code}] invalid (Lesefehler): {e}")
+        return {"status": "invalid"}
 
-    blob = gzip.compress(codes.tobytes(), 9, mtime=0)
-    fname = f"dbz_{code}_{ts}"
+    nodata_share = float((codes == sn.NODATA_CODE).mean())
+    print(f"[{code}] Anteil nodata: {nodata_share:.1%}")
+    if nodata_share > MAX_NODATA:
+        print(f"[{code}] invalid: {nodata_share:.1%} > {MAX_NODATA:.0%} nodata")
+        return {"status": "invalid"}
 
-    # var_type == Dateiname-Praefix, d.h. Datei = f"{var_type}_{timestep}"
-    var_type = f"dbz_{code}"
-
-    existing = get_existing(s3, bucket, f"{prefix}/metadata.json")
-    old_ts = existing.get("var_types", {}).get(var_type, {}).get("timesteps", [])
-    all_ts = sorted(set(old_ts) | {ts})
-    kept, dropped = all_ts[-MAX_KEEP:], all_ts[:-MAX_KEEP]
-
-    meta = {
-        "run": ts,
-        "date": ts.split("_")[0],
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-        "grid": grid,
-        "var_types": {
-            var_type: {
-                "num_steps": len(kept),
-                "timesteps": kept,
-            }
-        },
-    }
-
-    # Reihenfolge: erst Binaerdatei, dann metadata (sonst zeigt sie auf Nicht-Existentes), dann aufraeumen
     s3.put_object(
-        Bucket=bucket, Key=f"{prefix}/{fname}", Body=blob,
+        Bucket=bucket,
+        Key=f"{R2_PREFIX}/dbz_{code}_latest",
+        Body=gzip.compress(codes.tobytes(), 9, mtime=0),
         ContentType="application/gzip",
-        CacheControl="public, max-age=31536000, immutable",
+        CacheControl=CACHE,
     )
-    s3.put_object(
-        Bucket=bucket, Key=f"{prefix}/metadata.json",
-        Body=json.dumps(meta, indent=2).encode("utf-8"),
-        ContentType="application/json",
-        CacheControl="public, max-age=30",
-    )
-    for old in dropped:
-        s3.delete_object(Bucket=bucket, Key=f"{prefix}/dbz_{code}_{old}")
-
-    return f"[{code}] OK {fname} ({len(blob)} B gz), {len(kept)} Steps, {len(dropped)} geloescht"
+    print(f"[{code}] OK {ts}")
+    return {"status": "ok", "timestamp": ts, "grid": grid}
 
 
 def main() -> None:
     sites = json.loads(SITES_FILE.read_text(encoding="utf-8"))
     only = set(sys.argv[1:])
-    if only:
-        sites = [s for s in sites if s["code"] in only]
+    run_sites = [s for s in sites if not only or s["code"] in only]
 
-    now = int(time.time())
-    slot = datetime.fromtimestamp(now // 300 * 300, tz=timezone.utc)
-    deadline = time.time() + WAIT_SECONDS
-    print(f"Slot {slot:%Y-%m-%d %H:%M} UTC, {len(sites)} Standorte")
+    slot = datetime.fromtimestamp(int(time.time()) // 300 * 300, tz=timezone.utc)
+    print(f"Slot {slot:%Y-%m-%d %H:%M} UTC, {len(run_sites)} Standorte")
 
     s3 = boto3.client(
         "s3",
@@ -185,20 +172,60 @@ def main() -> None:
         region_name="auto",
     )
     bucket = os.environ["R2_BUCKET"]
+    meta_key = f"{R2_PREFIX}/metadata.json"
 
-    failed = []
-    with ThreadPoolExecutor(max_workers=len(sites) or 1) as pool:
-        futs = {pool.submit(process_site, s3, bucket, s, slot, deadline): s["code"] for s in sites}
+    old_radars = get_json(s3, bucket, meta_key).get("radars", {})
+    radars = dict(old_radars)
+
+    errors = []
+    with ThreadPoolExecutor(max_workers=len(run_sites) or 1) as pool:
+        futs = {}
+        for s in run_sites:
+            prev = old_radars.get(s["code"], {})
+            # Radar war zuletzt schon gestoert -> nicht wieder 3 Minuten warten
+            wait = WAIT_SECONDS if prev.get("status", "ok") == "ok" else RETRY_WAIT_SECONDS
+            futs[pool.submit(process_site, s3, bucket, s, slot, wait)] = s
+
         for fut in as_completed(futs):
-            code = futs[fut]
+            s = futs[fut]
+            code = s["code"]
             try:
-                print(fut.result())
-            except Exception as e:  # ein Standort darf die anderen nicht killen
+                update = fut.result()
+            except Exception as e:  # z.B. R2-Upload fehlgeschlagen: Eintrag unveraendert lassen
                 print(f"[{code}] FEHLER: {e}")
-                failed.append(code)
+                errors.append(code)
+                continue
+            prev = old_radars.get(code, {})
+            radars[code] = {
+                "wmo": s["wmo"],
+                "status": update["status"],
+                "timestamp": update.get("timestamp", prev.get("timestamp")),
+                "file": f"dbz_{code}_latest",
+                "grid": update.get("grid", prev.get("grid")),
+            }
 
-    if failed:
-        print(f"::error::Fehlgeschlagen: {', '.join(failed)}")
+    # Reihenfolge wie in sites.json
+    order = [s["code"] for s in sites]
+    radars = {c: radars[c] for c in order if c in radars} | {c: v for c, v in radars.items() if c not in order}
+
+    meta = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+        "radars": radars,
+    }
+    s3.put_object(
+        Bucket=bucket, Key=meta_key,
+        Body=json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8"),
+        ContentType="application/json",
+        CacheControl=CACHE,
+    )
+
+    summary = ", ".join(f"{c}={v['status']}" for c, v in radars.items())
+    print(f"metadata.json geschrieben: {summary}")
+    bad = [c for c, v in radars.items() if v["status"] != "ok"]
+    if bad:
+        print(f"::warning::Radare nicht ok: {', '.join(bad)}")
+    if errors:
+        print(f"::error::Upload-Fehler: {', '.join(errors)}")
         sys.exit(1)
 
 

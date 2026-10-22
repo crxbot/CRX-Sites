@@ -3,5 +3,8 @@
   { "code": "mem", "wmo": "10950" },
   { "code": "oft", "wmo": "10629" },
   { "code": "neu", "wmo": "10557" },
-  { "code": "ros", "wmo": "10169" }
+  { "code": "ros", "wmo": "10169" },
+  { "code": "asb", "wmo": "10103" },
+  { "code": "boo", "wmo": "10132" },
+  { "code": "drs", "wmo": "10488" }
 ]
