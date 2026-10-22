@@ -11,7 +11,8 @@ status:  ok           Datei geladen, gewandelt, hochgeladen
 
 Quelle:  DWD Polar-Sweeps, 0.5 Grad, DBZH:
          https://opendata.dwd.de/weather/radar/sites/sweep_vol_z/<code>/hdf5/filter_simple/
-         Dateien erscheinen immer zu den Minuten :03 :08 :13 :18 ... (alle 5 min, Sekunden variieren -> Verzeichnisliste)
+         Alle 5 min eine Datei pro Standort; Minute/Sekunde sind je Standort verschieden (z.B. boo 20:38:01, mem 20:57:52)
+         -> es wird die NEUESTE Datei aus der Verzeichnisliste genommen, der Zeitstempel kommt aus dem Dateinamen (UTC).
 
 Aufruf:  python scripts/generate_data.py            (alle Standorte aus scripts/sites.json)
          python scripts/generate_data.py umd mem    (nur diese; die anderen Eintraege bleiben unveraendert)
@@ -41,7 +42,7 @@ import site_native as sn  # liegt im selben Ordner (scripts/)
 
 BASE_URL = "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z"   # + /<code>/hdf5/filter_simple/
 ELEV = os.environ.get("SITES_ELEV", "05")       # Elevations-Kennung im Dateinamen: 05 = 0.5 Grad
-SLOT_MINUTE_OFFSET = 3                          # Dateien liegen auf Minute 3, 8, 13, ... (jeweils +5)
+MAX_AGE_MIN = int(os.environ.get("SITES_MAX_AGE_MIN", "20"))   # aelter als das gilt als "nicht verfuegbar"
 GRACE_SECONDS = int(os.environ.get("SITES_GRACE_SECONDS", "30"))   # Nachfrist fuer Nachzuegler, sobald ein Standort fertig geladen hat
 POLL_SECONDS = 10                               # Abstand der Verzeichnis-Abfragen beim Warten
 R2_PREFIX = os.environ.get("SITES_R2_PREFIX", "sites/radar")
@@ -167,40 +168,54 @@ def list_files(site: dict) -> list[str]:
     return re.findall(r'href="([^"/]+-hd5)"', html)
 
 
-def find_slot_file(site: dict, slot: datetime) -> str | None:
-    """Name der Datei fuer diesen Slot (Sekunden/Hundertstel stehen nicht fest -> per Praefix YYYYmmddHHMM suchen)."""
+def find_latest_file(site: dict) -> tuple[str, datetime] | None:
+    """Neueste Datei des Standorts (Name, Zeit aus dem Dateinamen in UTC) oder None."""
     pat = re.compile(
-        rf"ras\d+-stqual-vol5minng01_sweeph5onem_dbzh_{ELEV}-{slot:%Y%m%d%H%M}\d{{4}}"
+        rf"ras\d+-stqual-vol5minng01_sweeph5onem_dbzh_{ELEV}-(\d{{14}})\d{{2}}"
         rf"-{re.escape(site['code'])}-{re.escape(site['wmo'])}-hd5$",
         re.IGNORECASE,
     )
-    hits = sorted(n for n in list_files(site) if pat.match(n))
-    return hits[-1] if hits else None
+    best = None
+    for n in list_files(site):
+        m = pat.match(n)
+        if m and (best is None or m.group(1) > best[0]):
+            best = (m.group(1), n)
+    if best is None:
+        return None
+    return best[1], datetime.strptime(best[0], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
 
 
-def download(site: dict, slot: datetime, dest: Path, wait: int) -> str:
-    """Laedt die Slot-Datei; solange sie im Verzeichnis fehlt, alle POLL_SECONDS erneut, bis `wait` s um sind (dann TimeoutError).
+def download(site: dict, newer_than: str | None, dest: Path, wait: int) -> tuple[str, datetime]:
+    """Laedt die neueste Datei, sofern sie juenger als `newer_than` ("%Y%m%d_%H%M") und nicht aelter als MAX_AGE_MIN ist.
 
+    Gibt es noch nichts Neues, wird alle POLL_SECONDS erneut gefragt, bis `wait` s um sind (dann TimeoutError).
     Sobald irgendein Standort seine Datei hat, endet das Warten der anderen spaetestens GRACE_SECONDS danach.
     """
     global _first_done
     start = time.time()
     attempt = 0
-    label = f"{slot:%H:%M}"
     while True:
         attempt += 1
         try:
-            name = find_slot_file(site, slot)
-            if name:
-                url = f"{BASE_URL}/{site['code']}/hdf5/filter_simple/{name}"
-                with urllib.request.urlopen(url, timeout=30) as r:
-                    data = r.read()
-                if data:
-                    dest.write_bytes(data)
-                    if _first_done is None:
-                        _first_done = time.time()
-                    print(f"[{site['code']}] geladen (Versuch {attempt}): {name}")
-                    return name
+            found = find_latest_file(site)
+            if found:
+                name, ft = found
+                stamp = ft.strftime("%Y%m%d_%H%M")
+                age_min = (datetime.now(timezone.utc) - ft).total_seconds() / 60
+                if newer_than and stamp <= newer_than:
+                    pass                                    # schon veroeffentlicht, auf die naechste warten
+                elif age_min > MAX_AGE_MIN:
+                    print(f"[{site['code']}] neueste Datei {stamp} ist {age_min:.0f} min alt (> {MAX_AGE_MIN})")
+                else:
+                    url = f"{BASE_URL}/{site['code']}/hdf5/filter_simple/{name}"
+                    with urllib.request.urlopen(url, timeout=30) as r:
+                        data = r.read()
+                    if data:
+                        dest.write_bytes(data)
+                        if _first_done is None:
+                            _first_done = time.time()
+                        print(f"[{site['code']}] geladen (Versuch {attempt}): {name}")
+                        return name, ft
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 print(f"[{site['code']}] HTTP {e.code}")
@@ -211,7 +226,7 @@ def download(site: dict, slot: datetime, dest: Path, wait: int) -> str:
         if _first_done is not None:
             deadline = min(deadline, max(_first_done + GRACE_SECONDS, start + POLL_SECONDS))
         if time.time() > deadline:
-            raise TimeoutError(f"Slot {label} fuer {site['code']} nicht verfuegbar")
+            raise TimeoutError(f"keine neue Datei fuer {site['code']}")
         time.sleep(POLL_SECONDS)
 
 
@@ -227,15 +242,15 @@ def get_json(s3, bucket: str, key: str) -> dict:
         return {}
 
 
-def process_site(s3, bucket: str, site: dict, slot: datetime, wait: int) -> dict:
+def process_site(s3, bucket: str, site: dict, prev_ts: str | None, wait: int) -> dict:
     """Update fuer den Meta-Eintrag: {"status": ...} bzw. bei ok zusaetzlich timestamp, lat, lon, grid."""
     code = site["code"]
-    ts = slot.strftime("%Y%m%d_%H%M")
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "in.hd5"
-            download(site, slot, src, wait)
+            _name, file_time = download(site, prev_ts, src, wait)
+            ts = file_time.strftime("%Y%m%d_%H%M")       # Zeit aus dem Dateinamen
             codes, grid, (lat, lon) = convert(src)
     except TimeoutError as e:
         print(f"[{code}] unavailable: {e}")
@@ -277,10 +292,7 @@ def main() -> None:
     only = set(sys.argv[1:])
     run_sites = [s for s in sites if not only or s["code"] in only]
 
-    # juengster Slot <= jetzt auf :03 :08 :13 ... (Minute = 3 mod 5)
-    off = SLOT_MINUTE_OFFSET * 60
-    slot = datetime.fromtimestamp((int(time.time()) - off) // 300 * 300 + off, tz=timezone.utc)
-    print(f"Slot {slot:%Y-%m-%d %H:%M} UTC, {len(run_sites)} Standorte")
+    print(f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC, {len(run_sites)} Standorte")
 
     s3 = boto3.client(
         "s3",
@@ -304,7 +316,7 @@ def main() -> None:
             prev = old_radars.get(s["code"], {})
             # Radar war zuletzt schon gestoert -> nicht wieder 3 Minuten warten
             wait = WAIT_SECONDS if prev.get("status", "ok") == "ok" else RETRY_WAIT_SECONDS
-            futs[pool.submit(process_site, s3, bucket, s, slot, wait)] = s["code"]
+            futs[pool.submit(process_site, s3, bucket, s, prev.get("timestamp"), wait)] = s["code"]
         for fut in as_completed(futs):
             code = futs[fut]
             try:
