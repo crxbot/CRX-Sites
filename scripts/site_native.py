@@ -36,7 +36,7 @@ FILENAME_RE = re.compile(
 )
 
 DBZ_MIN = 0.0
-DBZ_STEP = 0.5
+DBZ_STEP = 1.0
 NODATA_CODE = 255
 MAX_CODE = 254
 
