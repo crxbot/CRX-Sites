@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DWD-Einzelstandort (ODIM-HDF5, Polar-Sweep 0.5 Grad, DBZH) -> natives uint8-Raster in dBZ (400 x 400 px, 1 km).
+"""DWD-Einzelstandort (ODIM-HDF5, Polar-Sweep 0.5 Grad, DBZH, 360 Strahlen x 720 Bins x 250 m) -> natives uint8-Raster in dBZ (1440 x 1440 px, 250 m).
 
 Dateiname: ras07-stqual-vol5minng01_sweeph5onem_dbzh_<elev>-<yyyymmddHHMMSS><cc>-<kuerzel>-<WMO-Nr>-hd5
            z.B. ras07-stqual-vol5minng01_sweeph5onem_dbzh_05-2026102220380100-boo-10132-hd5
@@ -129,7 +129,7 @@ def read_dbz(ds: h5py.Dataset) -> np.ndarray:
     if undetect is not None and undetect != nodata:
         dbz[raw == undetect] = -np.inf
 
-    dbz[np.isfinite(dbz) & (dbz < 0)] = np.nan
+    # Werte < DBZ_MIN (Rauschen, bis -64 dBZ) sind gemessen -> encode_dbz macht daraus Code 0 (kein Echo), NICHT Nodata
 
     print(f"quantity='{_s(a.get('quantity', ''))}', gain={gain}, offset={offset}, "
           f"nodata={nodata}, undetect={undetect}")
@@ -156,8 +156,8 @@ def find_where(f: h5py.File) -> h5py.Group:
 
 
 
-GRID_N = 400            # Zielraster bei Polar-Daten: 400 x 400 px
-GRID_PS = 1000.0        # 1 km / px  -> +-200 km um das Radar
+GRID_N = 1440           # Zielraster bei Polar-Daten: 1440 x 1440 px
+GRID_PS = 250.0         # 250 m / px (= Bin-Laenge der Sweeps) -> +-180 km um das Radar
 
 
 def dump_structure(f: h5py.File) -> None:
@@ -213,24 +213,29 @@ def polar_to_grid(dbz: np.ndarray, p: dict) -> tuple[np.ndarray, str]:
     if dbz.shape != (p["nrays"], p["nbins"]):
         raise RuntimeError(f"Array {dbz.shape} passt nicht zu nrays/nbins {(p['nrays'], p['nbins'])}")
     half = GRID_N * GRID_PS / 2
-    xs = (np.arange(GRID_N) + 0.5) * GRID_PS - half
-    ys = half - (np.arange(GRID_N) + 0.5) * GRID_PS
+    xs = ((np.arange(GRID_N) + 0.5) * GRID_PS - half).astype(np.float32)
+    ys = (half - (np.arange(GRID_N) + 0.5) * GRID_PS).astype(np.float32)
     X, Y = np.meshgrid(xs, ys)
     rng = np.hypot(X, Y)
     az = np.degrees(np.arctan2(X, Y)) % 360.0                  # 0 = Nord, im Uhrzeigersinn
+    del X, Y
+
+    # Winkel -> Strahl ueber eine 0.1-Grad-Tabelle (spart Speicher gegenueber Pro-Pixel-Suche)
+    centers = (np.arange(3600) + 0.5) / 10.0
     if p.get("az_mid") is not None:
-        # echte Strahlwinkel: naechster Strahl (Array ist zeitlich, nicht nach Azimut sortiert)
         order = np.argsort(p["az_mid"])
         srt = p["az_mid"][order]
-        i = np.searchsorted(srt, az.ravel())
+        i = np.searchsorted(srt, centers)
         lo, hi = srt[(i - 1) % srt.size], srt[i % srt.size]
-        d_lo = np.abs((az.ravel() - lo + 180.0) % 360.0 - 180.0)
-        d_hi = np.abs((az.ravel() - hi + 180.0) % 360.0 - 180.0)
-        pick = np.where(d_lo <= d_hi, (i - 1) % srt.size, i % srt.size)
-        ray = order[pick].reshape(az.shape)
+        d_lo = np.abs((centers - lo + 180.0) % 360.0 - 180.0)
+        d_hi = np.abs((centers - hi + 180.0) % 360.0 - 180.0)
+        lut = order[np.where(d_lo <= d_hi, (i - 1) % srt.size, i % srt.size)]
     else:
-        ray = (np.floor(az / (360.0 / p["nrays"])).astype(int) + p["a1gate"]) % p["nrays"]
-    b = np.floor((rng - p["rstart_m"]) / p["rscale"]).astype(int)
+        lut = (np.floor(centers / (360.0 / p["nrays"])).astype(int) + p["a1gate"]) % p["nrays"]
+    ray = lut[np.minimum((az * 10).astype(np.int32), 3599)]
+    del az
+
+    b = np.floor((rng - p["rstart_m"]) / p["rscale"]).astype(np.int32)
     inside = (b >= 0) & (b < p["nbins"])
     out = np.full((GRID_N, GRID_N), np.nan)                    # ausserhalb Reichweite = nodata
     out[inside] = dbz[ray[inside], b[inside]]
