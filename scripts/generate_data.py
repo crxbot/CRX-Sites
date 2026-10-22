@@ -42,6 +42,7 @@ import site_native as sn  # liegt im selben Ordner (scripts/)
 
 BASE_URL = "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z"   # + /<code>/hdf5/filter_simple/
 ELEV = os.environ.get("SITES_ELEV", "05")       # Elevations-Kennung im Dateinamen: 05 = 0.5 Grad
+FILTER = os.environ.get("SITES_FILTER", "filter_polarimetric")   # oder "filter_simple"
 MAX_AGE_MIN = int(os.environ.get("SITES_MAX_AGE_MIN", "20"))   # aelter als das gilt als "nicht verfuegbar"
 GRACE_SECONDS = int(os.environ.get("SITES_GRACE_SECONDS", "30"))   # Nachfrist fuer Nachzuegler, sobald ein Standort fertig geladen hat
 POLL_SECONDS = 10                               # Abstand der Verzeichnis-Abfragen beim Warten
@@ -162,7 +163,7 @@ _first_done: float | None = None   # Zeitpunkt, an dem der erste Standort seine 
 
 def list_files(site: dict) -> list[str]:
     """Dateinamen aus dem DWD-Verzeichnis des Standorts (Apache-Index)."""
-    url = f"{BASE_URL}/{site['code']}/hdf5/filter_simple/"
+    url = f"{BASE_URL}/{site['code']}/hdf5/{FILTER}/"
     with urllib.request.urlopen(url, timeout=30) as r:
         html = r.read().decode("utf-8", errors="ignore")
     return re.findall(r'href="([^"/]+-hd5)"', html)
@@ -171,7 +172,7 @@ def list_files(site: dict) -> list[str]:
 def find_latest_file(site: dict) -> tuple[str, datetime] | None:
     """Neueste Datei des Standorts (Name, Zeit aus dem Dateinamen in UTC) oder None."""
     pat = re.compile(
-        rf"ras\d+-stqual-vol5minng01_sweeph5onem_dbzh_{ELEV}-(\d{{14}})\d{{2}}"
+        rf"ras\d+(?:-stqual)?-vol5minng01_sweeph5onem_dbzh_{ELEV}-(\d{{14}})\d{{2}}"
         rf"-{re.escape(site['code'])}-{re.escape(site['wmo'])}-hd5$",
         re.IGNORECASE,
     )
@@ -207,7 +208,7 @@ def download(site: dict, newer_than: str | None, dest: Path, wait: int) -> tuple
                 elif age_min > MAX_AGE_MIN:
                     print(f"[{site['code']}] neueste Datei {stamp} ist {age_min:.0f} min alt (> {MAX_AGE_MIN})")
                 else:
-                    url = f"{BASE_URL}/{site['code']}/hdf5/filter_simple/{name}"
+                    url = f"{BASE_URL}/{site['code']}/hdf5/{FILTER}/{name}"
                     with urllib.request.urlopen(url, timeout=30) as r:
                         data = r.read()
                     if data:
