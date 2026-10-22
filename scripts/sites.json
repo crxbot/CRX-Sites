@@ -5,6 +5,6 @@
   { "code": "neu", "wmo": "10557" },
   { "code": "ros", "wmo": "10169" },
   { "code": "asb", "wmo": "10103" },
-  { "code": "boo", "wmo": "10132" },
+  { "code": "boo", "wmo": "10132", "name": "Boostedt" },
   { "code": "drs", "wmo": "10488" }
 ]

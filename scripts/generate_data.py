@@ -2,8 +2,8 @@
 """Alle DWD-Einzelstandorte: laden -> uint8-dBZ -> gzip -> R2 (nur das jeweils neueste Bild).
 
 R2-Layout:
-    sites/radar/metadata.json            (alle Radare: status, timestamp, grid)
-    sites/radar/dbz_<code>_latest        (gzip, wird pro Lauf ueberschrieben)
+    sites/radar/metadata.json            (alle Radare: status, timestamp, lat/lon, projdef; Grid einmal)
+    sites/radar/<code>/latest            (gzip, wird pro Lauf ueberschrieben)
 
 status:  ok           Datei geladen, gewandelt, hochgeladen
          unavailable  DWD hat die Datei nicht geliefert (404 bis Timeout) -> altes Bild + alter timestamp bleiben
@@ -11,6 +11,9 @@ status:  ok           Datei geladen, gewandelt, hochgeladen
 
 Aufruf:  python scripts/sites_radar.py            (alle Standorte aus scripts/sites.json)
          python scripts/sites_radar.py umd mem    (nur diese; die anderen Eintraege bleiben unveraendert)
+
+sites.json:  [{"code": "umd", "wmo": "10356", "name": "Ummendorf", "lat": 52.16, "lon": 11.17}, ...]
+             name, lat, lon sind optional; lat/lon dienen nur als Fallback, falls sie nicht in der HDF5-Datei stehen.
 """
 import gzip
 import json
@@ -33,24 +36,48 @@ import site_native as sn  # liegt im selben Ordner (scripts/)
 
 BASE_URL = "https://opendata.dwd.de/weather/radar/sites/lmax"
 R2_PREFIX = os.environ.get("SITES_R2_PREFIX", "sites/radar")
-WAIT_SECONDS = int(os.environ.get("SITES_WAIT_SECONDS", "180"))          # wartet auf die Datei
+WAIT_SECONDS = int(os.environ.get("SITES_WAIT_SECONDS", "180"))             # wartet auf die Datei
 RETRY_WAIT_SECONDS = int(os.environ.get("SITES_RETRY_WAIT_SECONDS", "20"))  # bei Radaren, die zuletzt nicht ok waren
-MAX_NODATA = float(os.environ.get("SITES_MAX_NODATA", "0.97"))           # Anteil Code 255, ab dem das Bild "invalid" ist
+MAX_NODATA = float(os.environ.get("SITES_MAX_NODATA", "0.97"))              # Anteil Code 255, ab dem das Bild "invalid" ist
 SITES_FILE = Path(__file__).with_name("sites.json")
 CACHE = "public, max-age=30"
 
+# Diese Grid-Felder stehen einmal oben in der metadata.json; die projdef steht pro Radar.
+SHARED_KEYS = ("format", "width", "height", "row_order", "pixel_size_m",
+               "ll_x", "ll_y", "extent_native", "nodata")
+
+
+def find_location(f: h5py.File):
+    """lat/lon des Radarstandorts aus der HDF5-Datei, sonst (None, None)."""
+    root = f.get("where")
+    grp = root if (root is not None and "lat" in root.attrs and "lon" in root.attrs) else None
+    if grp is None:
+        found = []
+
+        def visitor(name, obj):
+            if not found and isinstance(obj, h5py.Group) and "lat" in obj.attrs and "lon" in obj.attrs:
+                found.append(obj)
+
+        f.visititems(visitor)
+        grp = found[0] if found else None
+    if grp is None:
+        return None, None
+    return round(float(sn._x(grp.attrs["lat"])), 5), round(float(sn._x(grp.attrs["lon"])), 5)
+
 
 def convert(path: Path):
-    """HDF5 -> (uint8-Codes, grid-dict). Gleiche Logik wie main() in site_native.py."""
+    """HDF5 -> (uint8-Codes, volles Grid-dict inkl. projdef, (lat, lon)). Logik wie main() in site_native.py."""
     with h5py.File(path, "r") as f:
         ds = sn.find_dbz_dataset(f)
         dbz = sn.read_dbz(ds)
+        loc = find_location(f)
         polar = sn.find_polar_info(f, ds)
         if polar:
             dbz, projdef = sn.polar_to_grid(dbz, polar)
             h, w = dbz.shape
             xs = ys = sn.GRID_PS
             ll_x = ll_y = -sn.GRID_N * sn.GRID_PS / 2
+            loc = (round(polar["lat"], 5), round(polar["lon"], 5))
         else:
             wh = ds.parent.parent.get("where")
             if wh is None or "projdef" not in wh.attrs:
@@ -74,14 +101,14 @@ def convert(path: Path):
         "width": w,
         "height": h,
         "row_order": "north-to-south",
-        "projdef": projdef,
         "pixel_size_m": xs,
         "ll_x": ll_x,
         "ll_y": ll_y,
         "extent_native": [ll_x, ll_y, round(ll_x + w * xs, 3), round(ll_y + h * ys, 3)],
         "nodata": sn.NODATA_CODE,
+        "projdef": projdef,
     }
-    return codes, grid
+    return codes, grid, loc
 
 
 def download(site: dict, slot: datetime, dest: Path, wait: int) -> None:
@@ -123,7 +150,7 @@ def get_json(s3, bucket: str, key: str) -> dict:
 
 
 def process_site(s3, bucket: str, site: dict, slot: datetime, wait: int) -> dict:
-    """Gibt das Update fuer den Meta-Eintrag zurueck: {"status": ..., (nur bei ok:) "timestamp", "grid"}."""
+    """Update fuer den Meta-Eintrag: {"status": ...} bzw. bei ok zusaetzlich timestamp, lat, lon, grid."""
     code = site["code"]
     ts = slot.strftime("%Y%m%d_%H%M")
 
@@ -131,7 +158,7 @@ def process_site(s3, bucket: str, site: dict, slot: datetime, wait: int) -> dict
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "in.hd5"
             download(site, slot, src, wait)
-            codes, grid = convert(src)
+            codes, grid, (lat, lon) = convert(src)
     except TimeoutError as e:
         print(f"[{code}] unavailable: {e}")
         return {"status": "unavailable"}
@@ -147,17 +174,28 @@ def process_site(s3, bucket: str, site: dict, slot: datetime, wait: int) -> dict
 
     s3.put_object(
         Bucket=bucket,
-        Key=f"{R2_PREFIX}/dbz_{code}_latest",
+        Key=f"{R2_PREFIX}/{code}/latest",
         Body=gzip.compress(codes.tobytes(), 9, mtime=0),
         ContentType="application/gzip",
         CacheControl=CACHE,
     )
     print(f"[{code}] OK {ts}")
-    return {"status": "ok", "timestamp": ts, "grid": grid}
+    return {
+        "status": "ok",
+        "timestamp": ts,
+        "lat": lat if lat is not None else site.get("lat"),
+        "lon": lon if lon is not None else site.get("lon"),
+        "grid": grid,
+    }
+
+
+def first(*vals):
+    return next((v for v in vals if v is not None), None)
 
 
 def main() -> None:
     sites = json.loads(SITES_FILE.read_text(encoding="utf-8"))
+    order = [s["code"] for s in sites]
     only = set(sys.argv[1:])
     run_sites = [s for s in sites if not only or s["code"] in only]
 
@@ -174,9 +212,11 @@ def main() -> None:
     bucket = os.environ["R2_BUCKET"]
     meta_key = f"{R2_PREFIX}/metadata.json"
 
-    old_radars = get_json(s3, bucket, meta_key).get("radars", {})
-    radars = dict(old_radars)
+    old_meta = get_json(s3, bucket, meta_key)
+    old_radars = old_meta.get("radars", {})
+    old_shared = old_meta.get("grid") or {}
 
+    updates: dict[str, dict] = {}
     errors = []
     with ThreadPoolExecutor(max_workers=len(run_sites) or 1) as pool:
         futs = {}
@@ -184,32 +224,65 @@ def main() -> None:
             prev = old_radars.get(s["code"], {})
             # Radar war zuletzt schon gestoert -> nicht wieder 3 Minuten warten
             wait = WAIT_SECONDS if prev.get("status", "ok") == "ok" else RETRY_WAIT_SECONDS
-            futs[pool.submit(process_site, s3, bucket, s, slot, wait)] = s
-
+            futs[pool.submit(process_site, s3, bucket, s, slot, wait)] = s["code"]
         for fut in as_completed(futs):
-            s = futs[fut]
-            code = s["code"]
+            code = futs[fut]
             try:
-                update = fut.result()
+                updates[code] = fut.result()
             except Exception as e:  # z.B. R2-Upload fehlgeschlagen: Eintrag unveraendert lassen
                 print(f"[{code}] FEHLER: {e}")
                 errors.append(code)
-                continue
-            prev = old_radars.get(code, {})
-            radars[code] = {
-                "wmo": s["wmo"],
-                "status": update["status"],
-                "timestamp": update.get("timestamp", prev.get("timestamp")),
-                "file": f"dbz_{code}_latest",
-                "grid": update.get("grid", prev.get("grid")),
-            }
 
-    # Reihenfolge wie in sites.json
-    order = [s["code"] for s in sites]
-    radars = {c: radars[c] for c in order if c in radars} | {c: v for c, v in radars.items() if c not in order}
+    # --- Eintraege + volle Grids je Radar zusammenbauen (alt + neu) ---
+    radars: dict[str, dict] = {}
+    fulls: dict[str, dict] = {}
+    for s in sites:
+        code = s["code"]
+        prev = old_radars.get(code)
+        upd = updates.get(code)
+        if upd is None:
+            if prev is not None:
+                radars[code] = dict(prev)
+                if prev.get("projdef"):
+                    fulls[code] = {**old_shared, **(prev.get("grid") or {}), "projdef": prev["projdef"]}
+            continue
+        prev = prev or {}
+        entry = {"wmo": s["wmo"]}
+        if s.get("name"):
+            entry["name"] = s["name"]
+        entry["status"] = upd["status"]
+        entry["timestamp"] = first(upd.get("timestamp"), prev.get("timestamp"))
+        entry["lat"] = first(upd.get("lat"), prev.get("lat"), s.get("lat"))
+        entry["lon"] = first(upd.get("lon"), prev.get("lon"), s.get("lon"))
+        entry["file"] = f"{code}/latest"
+        if upd["status"] == "ok":
+            fulls[code] = upd["grid"]
+        elif prev.get("projdef"):
+            fulls[code] = {**old_shared, **(prev.get("grid") or {}), "projdef": prev["projdef"]}
+        radars[code] = entry
+    for code, prev in old_radars.items():       # Radare, die nicht (mehr) in sites.json stehen, unveraendert lassen
+        if code not in radars:
+            radars[code] = prev
+
+    # --- Grid einmal oben; projdef pro Radar; Abweichler bekommen ein eigenes "grid" ---
+    ref = None
+    for code in order + [c for c in fulls if c not in order]:
+        if code in fulls:
+            ref = {k: fulls[code][k] for k in SHARED_KEYS}
+            break
+    for code, full in fulls.items():
+        radars[code].pop("grid", None)
+        radars[code]["projdef"] = full["projdef"]
+        shared = {k: full[k] for k in SHARED_KEYS}
+        if shared != ref:
+            print(f"::warning::[{code}] Grid weicht vom gemeinsamen Grid ab, eigener grid-Eintrag")
+            radars[code]["grid"] = shared
+    for code, r in radars.items():
+        r.setdefault("projdef", None)
 
     meta = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+        "grid": ref or old_shared,
         "radars": radars,
     }
     s3.put_object(
@@ -219,9 +292,8 @@ def main() -> None:
         CacheControl=CACHE,
     )
 
-    summary = ", ".join(f"{c}={v['status']}" for c, v in radars.items())
-    print(f"metadata.json geschrieben: {summary}")
-    bad = [c for c, v in radars.items() if v["status"] != "ok"]
+    print("metadata.json geschrieben: " + ", ".join(f"{c}={v.get('status')}" for c, v in radars.items()))
+    bad = [c for c, v in radars.items() if v.get("status") != "ok"]
     if bad:
         print(f"::warning::Radare nicht ok: {', '.join(bad)}")
     if errors:
