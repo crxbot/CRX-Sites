@@ -9,8 +9,12 @@ status:  ok           Datei geladen, gewandelt, hochgeladen
          unavailable  DWD hat die Datei nicht geliefert (404 bis Timeout) -> altes Bild + alter timestamp bleiben
          invalid      Datei kaputt / nicht lesbar / fast nur "kein Datum" -> altes Bild + alter timestamp bleiben
 
-Aufruf:  python scripts/sites_radar.py            (alle Standorte aus scripts/sites.json)
-         python scripts/sites_radar.py umd mem    (nur diese; die anderen Eintraege bleiben unveraendert)
+Quelle:  DWD Polar-Sweeps, 0.5 Grad, DBZH:
+         https://opendata.dwd.de/weather/radar/sites/sweep_vol_z/<code>/hdf5/filter_simple/
+         Dateien erscheinen immer zu den Minuten :03 :08 :13 :18 ... (alle 5 min, Sekunden variieren -> Verzeichnisliste)
+
+Aufruf:  python scripts/generate_data.py            (alle Standorte aus scripts/sites.json)
+         python scripts/generate_data.py umd mem    (nur diese; die anderen Eintraege bleiben unveraendert)
 
 sites.json:  [{"code": "umd", "wmo": "10356", "name": "Ummendorf", "lat": 52.16, "lon": 11.17}, ...]
              name, lat, lon sind optional; lat/lon dienen nur als Fallback, falls sie nicht in der HDF5-Datei stehen.
@@ -35,7 +39,10 @@ from pyproj import Transformer
 
 import site_native as sn  # liegt im selben Ordner (scripts/)
 
-BASE_URL = "https://opendata.dwd.de/weather/radar/sites/lmax"
+BASE_URL = "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z"   # + /<code>/hdf5/filter_simple/
+ELEV = os.environ.get("SITES_ELEV", "05")       # Elevations-Kennung im Dateinamen: 05 = 0.5 Grad
+SLOT_MINUTE_OFFSET = 3                          # Dateien liegen auf Minute 3, 8, 13, ... (jeweils +5)
+POLL_SECONDS = 10                               # Abstand der Verzeichnis-Abfragen beim Warten
 R2_PREFIX = os.environ.get("SITES_R2_PREFIX", "sites/radar")
 WAIT_SECONDS = int(os.environ.get("SITES_WAIT_SECONDS", "180"))             # wartet auf die Datei
 RETRY_WAIT_SECONDS = int(os.environ.get("SITES_RETRY_WAIT_SECONDS", "20"))  # bei Radaren, die zuletzt nicht ok waren
@@ -148,30 +155,50 @@ def convert(path: Path):
     return codes, normalize(grid), loc
 
 
-def download(site: dict, slot: datetime, dest: Path, wait: int) -> None:
-    """Laedt die Slot-Datei; 404 -> alle 5 s erneut, bis `wait` Sekunden um sind (dann TimeoutError)."""
-    stamp = slot.strftime("%Y%m%d%H%M%S")
-    name = f"rab02-lm_{site['wmo']}-{stamp}-de{site['code']}-hd5"
-    url = f"{BASE_URL}/{site['code']}/{name}"
+def list_files(site: dict) -> list[str]:
+    """Dateinamen aus dem DWD-Verzeichnis des Standorts (Apache-Index)."""
+    url = f"{BASE_URL}/{site['code']}/hdf5/filter_simple/"
+    with urllib.request.urlopen(url, timeout=30) as r:
+        html = r.read().decode("utf-8", errors="ignore")
+    return re.findall(r'href="([^"/]+-hd5)"', html)
+
+
+def find_slot_file(site: dict, slot: datetime) -> str | None:
+    """Name der Datei fuer diesen Slot (Sekunden/Hundertstel stehen nicht fest -> per Praefix YYYYmmddHHMM suchen)."""
+    pat = re.compile(
+        rf"ras\d+-stqual-vol5minng01_sweeph5onem_dbzh_{ELEV}-{slot:%Y%m%d%H%M}\d{{4}}"
+        rf"-{re.escape(site['code'])}-{re.escape(site['wmo'])}-hd5$",
+        re.IGNORECASE,
+    )
+    hits = sorted(n for n in list_files(site) if pat.match(n))
+    return hits[-1] if hits else None
+
+
+def download(site: dict, slot: datetime, dest: Path, wait: int) -> str:
+    """Laedt die Slot-Datei; solange sie im Verzeichnis fehlt, alle POLL_SECONDS erneut, bis `wait` s um sind (dann TimeoutError)."""
     deadline = time.time() + wait
     attempt = 0
+    label = f"{slot:%H:%M}"
     while True:
         attempt += 1
         try:
-            with urllib.request.urlopen(url, timeout=30) as r:
-                data = r.read()
-            if data:
-                dest.write_bytes(data)
-                print(f"[{site['code']}] geladen (Versuch {attempt}): {name}")
-                return
+            name = find_slot_file(site, slot)
+            if name:
+                url = f"{BASE_URL}/{site['code']}/hdf5/filter_simple/{name}"
+                with urllib.request.urlopen(url, timeout=30) as r:
+                    data = r.read()
+                if data:
+                    dest.write_bytes(data)
+                    print(f"[{site['code']}] geladen (Versuch {attempt}): {name}")
+                    return name
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 print(f"[{site['code']}] HTTP {e.code}")
         except OSError as e:
             print(f"[{site['code']}] Netzfehler: {e}")
         if time.time() > deadline:
-            raise TimeoutError(f"{name} nicht verfuegbar")
-        time.sleep(5)
+            raise TimeoutError(f"Slot {label} fuer {site['code']} nicht verfuegbar")
+        time.sleep(POLL_SECONDS)
 
 
 def get_json(s3, bucket: str, key: str) -> dict:
@@ -236,7 +263,9 @@ def main() -> None:
     only = set(sys.argv[1:])
     run_sites = [s for s in sites if not only or s["code"] in only]
 
-    slot = datetime.fromtimestamp(int(time.time()) // 300 * 300, tz=timezone.utc)
+    # juengster Slot <= jetzt auf :03 :08 :13 ... (Minute = 3 mod 5)
+    off = SLOT_MINUTE_OFFSET * 60
+    slot = datetime.fromtimestamp((int(time.time()) - off) // 300 * 300 + off, tz=timezone.utc)
     print(f"Slot {slot:%Y-%m-%d %H:%M} UTC, {len(run_sites)} Standorte")
 
     s3 = boto3.client(
@@ -318,7 +347,8 @@ def main() -> None:
         r["ll_x"], r["ll_y"], r["extent_native"] = full["ll_x"], full["ll_y"], full["extent_native"]
         diff = {k: full[k] for k in SHARED_KEYS if full[k] != ref[k]}
         if diff:
-            print(f"::warning::[{code}] weicht vom gemeinsamen Grid ab: {', '.join(diff)}")
+            level = "::notice::" if set(diff) <= {"projdef"} else "::warning::"
+            print(f"{level}[{code}] weicht vom gemeinsamen Grid ab: {', '.join(diff)}")
             r["grid"] = diff
     for r in radars.values():
         for k in ("ll_x", "ll_y", "extent_native"):

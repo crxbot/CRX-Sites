@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""DWD-Einzelstandort (ODIM-HDF5, lmax, 400 x 400 px, 1 km) -> natives uint8-Raster in dBZ.
+"""DWD-Einzelstandort (ODIM-HDF5, Polar-Sweep 0.5 Grad, DBZH) -> natives uint8-Raster in dBZ (400 x 400 px, 1 km).
 
-Dateiname: rab02-lm_<WMO-Nr>-<yyyymmddHHMMSS>-de<kuerzel>-hd5
-           z.B. rab02-lm_10629-20261021115500-deoft-hd5   (oft = Offenthal)
+Dateiname: ras07-stqual-vol5minng01_sweeph5onem_dbzh_<elev>-<yyyymmddHHMMSS><cc>-<kuerzel>-<WMO-Nr>-hd5
+           z.B. ras07-stqual-vol5minng01_sweeph5onem_dbzh_05-2026102220380100-boo-10132-hd5
+           (elev 05 = 0.5 Grad, cc = Hundertstel-Sekunden, boo = Boostedt)
 
 Ausgabe: rohe uint8-Bytes, keine Dateiendung, ysize Zeilen x xsize Spalten, Zeile 0 = Norden.
 Die Werte BLEIBEN dBZ, nur in 0.5-dB-Schritten in ein Byte gepackt:
@@ -29,7 +30,10 @@ from pyproj import Transformer
 SRC_DIR = Path("data/site")
 OUT_DIR = Path("output/site")
 
-FILENAME_RE = re.compile(r"rab\d+-lm_(\d+)-(\d{14})-de([a-z0-9]+)-hd5", re.IGNORECASE)
+FILENAME_RE = re.compile(
+    r"ras\d+-stqual-vol5minng01_sweeph5onem_dbzh_(\d+)-(\d{14})\d{2}-([a-z0-9]+)-(\d+)-hd5",
+    re.IGNORECASE,
+)
 
 DBZ_MIN = 0.0
 DBZ_STEP = 0.5
@@ -62,7 +66,7 @@ def parse_filename(name: str) -> tuple[str, datetime, str]:
     m = FILENAME_RE.match(name)
     if not m:
         raise ValueError(f"Dateiname passt nicht zum Schema: {name}")
-    wmo, ts, code = m.groups()
+    _elev, ts, code, wmo = m.groups()
     t = datetime.strptime(ts, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     return wmo, t, code.lower()
 
@@ -169,21 +173,39 @@ def dump_structure(f: h5py.File) -> None:
 
 
 def find_polar_info(f: h5py.File, ds: h5py.Dataset):
-    """Polar-Infos (nrays/nbins/rscale/...) zum Dataset, sonst None."""
-    w = ds.parent.get("where")
-    if w is None or "nbins" not in w.attrs or "nrays" not in w.attrs:
+    """Polar-Infos (nrays/nbins/rscale/Azimute/...) zum Dataset, sonst None.
+
+    ODIM-Polar: .../dataset1/data1/data  ->  nbins/nrays/rscale/a1gate in .../dataset1/where,
+    Strahlwinkel in .../dataset1/how (startazA/stopazA), Standort lat/lon in /where.
+    """
+    w = None
+    for grp in (ds.parent, ds.parent.parent):
+        cand = grp.get("where")
+        if cand is not None and "nbins" in cand.attrs and "nrays" in cand.attrs:
+            w = cand
+            break
+    if w is None:
         return None
     root = f.get("where")
     src = root if (root is not None and "lat" in root.attrs) else w
-    return {
+    info = {
         "nbins": int(_x(w.attrs["nbins"])),
         "nrays": int(_x(w.attrs["nrays"])),
         "rscale": float(_x(w.attrs["rscale"])),
         "rstart_m": float(_x(w.attrs.get("rstart", 0.0))) * 1000.0,   # ODIM: rstart in km
         "a1gate": int(_x(w.attrs.get("a1gate", 0))),
+        "elangle": float(_x(w.attrs["elangle"])) if "elangle" in w.attrs else None,
         "lat": float(_x(src.attrs["lat"])),
         "lon": float(_x(src.attrs["lon"])),
+        "az_mid": None,
     }
+    how = w.parent.get("how") if w.name != "/" else None
+    if how is not None and "startazA" in how.attrs and "stopazA" in how.attrs:
+        a0 = np.asarray(how.attrs["startazA"], dtype=np.float64).ravel()
+        a1 = np.asarray(how.attrs["stopazA"], dtype=np.float64).ravel()
+        if a0.size == info["nrays"] and a1.size == info["nrays"]:
+            info["az_mid"] = (a0 + ((a1 - a0 + 180.0) % 360.0 - 180.0) / 2.0) % 360.0   # Strahlmitte, 0 = Nord
+    return info
 
 
 def polar_to_grid(dbz: np.ndarray, p: dict) -> tuple[np.ndarray, str]:
@@ -196,7 +218,18 @@ def polar_to_grid(dbz: np.ndarray, p: dict) -> tuple[np.ndarray, str]:
     X, Y = np.meshgrid(xs, ys)
     rng = np.hypot(X, Y)
     az = np.degrees(np.arctan2(X, Y)) % 360.0                  # 0 = Nord, im Uhrzeigersinn
-    ray = (np.floor(az / (360.0 / p["nrays"])).astype(int) + p["a1gate"]) % p["nrays"]
+    if p.get("az_mid") is not None:
+        # echte Strahlwinkel: naechster Strahl (Array ist zeitlich, nicht nach Azimut sortiert)
+        order = np.argsort(p["az_mid"])
+        srt = p["az_mid"][order]
+        i = np.searchsorted(srt, az.ravel())
+        lo, hi = srt[(i - 1) % srt.size], srt[i % srt.size]
+        d_lo = np.abs((az.ravel() - lo + 180.0) % 360.0 - 180.0)
+        d_hi = np.abs((az.ravel() - hi + 180.0) % 360.0 - 180.0)
+        pick = np.where(d_lo <= d_hi, (i - 1) % srt.size, i % srt.size)
+        ray = order[pick].reshape(az.shape)
+    else:
+        ray = (np.floor(az / (360.0 / p["nrays"])).astype(int) + p["a1gate"]) % p["nrays"]
     b = np.floor((rng - p["rstart_m"]) / p["rscale"]).astype(int)
     inside = (b >= 0) & (b < p["nbins"])
     out = np.full((GRID_N, GRID_N), np.nan)                    # ausserhalb Reichweite = nodata
@@ -235,7 +268,7 @@ def main() -> None:
     if args:
         src = Path(args[0])
     else:
-        files = sorted(p for p in SRC_DIR.glob("rab*-hd5") if FILENAME_RE.match(p.name))
+        files = sorted(p for p in SRC_DIR.glob("ras*-hd5") if FILENAME_RE.match(p.name))
         if not files:
             sys.exit(f"Keine Datei in {SRC_DIR} gefunden.")
         src = files[-1]
@@ -251,7 +284,7 @@ def main() -> None:
         dbz = read_dbz(ds)
         polar = find_polar_info(f, ds)
         if polar:
-            print(f"POLAR-Daten erkannt: {polar}")
+            print("POLAR-Daten erkannt:", {k: v for k, v in polar.items() if k != "az_mid"})
             dbz, projdef = polar_to_grid(dbz, polar)
             h, w = dbz.shape
             xscale = yscale = GRID_PS
