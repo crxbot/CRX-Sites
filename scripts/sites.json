@@ -1,10 +1,19 @@
 [
-  { "code": "umd", "wmo": "10356" },
-  { "code": "mem", "wmo": "10950" },
-  { "code": "oft", "wmo": "10629" },
-  { "code": "neu", "wmo": "10557" },
-  { "code": "ros", "wmo": "10169" },
-  { "code": "asb", "wmo": "10103" },
-  { "code": "boo", "wmo": "10132", "name": "Boostedt" },
-  { "code": "drs", "wmo": "10488" }
+  { "code": "asb", "wmo": "10103", "name": "Borkum",        "lat": 53.5641, "lon": 6.7483 },
+  { "code": "boo", "wmo": "10132", "name": "Boostedt",      "lat": 54.0044, "lon": 10.0469 },
+  { "code": "drs", "wmo": "10488", "name": "Dresden",       "lat": 51.1246, "lon": 13.7686 },
+  { "code": "eis", "wmo": "10780", "name": "Eisberg",       "lat": 49.5407, "lon": 12.4028 },
+  { "code": "ess", "wmo": "10410", "name": "Essen",         "lat": 51.4056, "lon": 6.9671 },
+  { "code": "fbg", "wmo": "10908", "name": "Feldberg",      "lat": 47.8736, "lon": 8.0036 },
+  { "code": "fld", "wmo": "10440", "name": "Flechtdorf",    "lat": 51.3112, "lon": 8.802 },
+  { "code": "hnr", "wmo": "10339", "name": "Hannover",      "lat": 52.4601, "lon": 9.6945 },
+  { "code": "isn", "wmo": "10873", "name": "Isen",          "lat": 48.1747, "lon": 12.1018 },
+  { "code": "mem", "wmo": "10950", "name": "Memmingen",     "lat": 48.0421, "lon": 10.2192 },
+  { "code": "neu", "wmo": "10557", "name": "Neuhaus",       "lat": 50.5001, "lon": 11.135 },
+  { "code": "nhb", "wmo": "10605", "name": "Neuheilenbach", "lat": 50.1097, "lon": 6.5483 },
+  { "code": "oft", "wmo": "10629", "name": "Offenthal",     "lat": 49.9847, "lon": 8.7129 },
+  { "code": "pro", "wmo": "10392", "name": "Prötzel",       "lat": 52.6487, "lon": 13.8582 },
+  { "code": "ros", "wmo": "10169", "name": "Rostock",       "lat": 54.1757, "lon": 12.0581 },
+  { "code": "tur", "wmo": "10832", "name": "Türkheim",      "lat": 48.5854, "lon": 9.7827 },
+  { "code": "umd", "wmo": "10356", "name": "Ummendorf",     "lat": 52.1601, "lon": 11.1761 }
 ]
