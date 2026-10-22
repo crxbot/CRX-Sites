@@ -65,19 +65,15 @@ def convert(path: Path):
     ll_x, ll_y = round(ll_x, 3), round(ll_y, 3)
     grid = {
         "format": "raw-uint8",
-        "encoding": "gzip",
-        "unit": "dBZ",
         "width": w,
         "height": h,
         "row_order": "north-to-south",
-        "dbz_min": sn.DBZ_MIN,
-        "dbz_step": sn.DBZ_STEP,
-        "nodata": [0, sn.NODATA_CODE],
         "projdef": projdef,
         "pixel_size_m": xs,
         "ll_x": ll_x,
         "ll_y": ll_y,
         "extent_native": [ll_x, ll_y, round(ll_x + w * xs, 3), round(ll_y + h * ys, 3)],
+        "nodata": sn.NODATA_CODE,
     }
     return codes, grid
 
@@ -131,19 +127,25 @@ def process_site(s3, bucket: str, site: dict, slot: datetime, deadline: float) -
     blob = gzip.compress(codes.tobytes(), 9, mtime=0)
     fname = f"dbz_{code}_{ts}"
 
+    # var_type == Dateiname-Praefix, d.h. Datei = f"{var_type}_{timestep}"
+    var_type = f"dbz_{code}"
+
     existing = get_existing(s3, bucket, f"{prefix}/metadata.json")
-    all_ts = sorted(set(existing.get("timesteps", [])) | {ts})
+    old_ts = existing.get("var_types", {}).get(var_type, {}).get("timesteps", [])
+    all_ts = sorted(set(old_ts) | {ts})
     kept, dropped = all_ts[-MAX_KEEP:], all_ts[:-MAX_KEEP]
 
     meta = {
-        "site": code,
-        "wmo": site["wmo"],
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "latest": kept[-1],
-        "num_steps": len(kept),
-        "timesteps": kept,
-        "file_pattern": f"dbz_{code}_{{timestep}}",
+        "run": ts,
+        "date": ts.split("_")[0],
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
         "grid": grid,
+        "var_types": {
+            var_type: {
+                "num_steps": len(kept),
+                "timesteps": kept,
+            }
+        },
     }
 
     # Reihenfolge: erst Binaerdatei, dann metadata (sonst zeigt sie auf Nicht-Existentes), dann aufraeumen
