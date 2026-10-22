@@ -1,0 +1,45 @@
+name: Fetch DWD Radar Sites
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: fetch-sites
+  cancel-in-progress: false
+
+jobs:
+  sites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.LIVE_PAT }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Cache Python packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt   # braucht zusaetzlich: boto3
+
+      - name: Alle Standorte laden, wandeln, zu R2 hochladen
+        run: python scripts/generate_data.py
+        env:
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          SITES_R2_PREFIX: sites/radar
+          SITES_MAX_KEEP: "6"
