@@ -1,5 +1,7 @@
 [
   { "code": "umd", "wmo": "10356" },
   { "code": "mem", "wmo": "10950" },
-  { "code": "oft", "wmo": "10629" }
+  { "code": "oft", "wmo": "10629" },
+  { "code": "neu", "wmo": "10557" },
+  { "code": "ros", "wmo": "10169" }
 ]
