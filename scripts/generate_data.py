@@ -18,6 +18,7 @@ sites.json:  [{"code": "umd", "wmo": "10356", "name": "Ummendorf", "lat": 52.16,
 import gzip
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -42,9 +43,45 @@ MAX_NODATA = float(os.environ.get("SITES_MAX_NODATA", "0.97"))              # An
 SITES_FILE = Path(__file__).with_name("sites.json")
 CACHE = "public, max-age=30"
 
-# Diese Grid-Felder stehen einmal oben in der metadata.json; die projdef steht pro Radar.
-SHARED_KEYS = ("format", "width", "height", "row_order", "pixel_size_m",
-               "ll_x", "ll_y", "extent_native", "nodata")
+# Diese Grid-Felder stehen einmal oben in der metadata.json (inkl. gemeinsamer projdef).
+# Pro Radar stehen nur ll_x, ll_y und extent_native (in dieser gemeinsamen Projektion).
+SHARED_KEYS = ("format", "width", "height", "row_order", "projdef", "pixel_size_m", "nodata")
+
+FALSE_ORIGIN = re.compile(r"\s\+(x_0|y_0)=(-?[\d.]+(?:[eE][-+]?\d+)?)")
+
+
+def normalize(grid: dict) -> dict:
+    """Entfernt +x_0/+y_0 aus der projdef und rechnet sie in ll_x/ll_y/extent_native ein.
+
+    Die DWD-Dateien nutzen dieselbe stereographische Projektion, verschieben aber den Ursprung
+    (false easting/northing) pro Standort. Ohne diese Verschiebung ist die projdef bei allen gleich;
+    ein Punkt hat dann x_true = x_site - x_0, y_true = y_site - y_0.
+    """
+    x0 = y0 = 0.0
+    for k, v in FALSE_ORIGIN.findall(grid["projdef"]):
+        if k.lower() == "x_0":
+            x0 = float(v)
+        else:
+            y0 = float(v)
+    ex = grid["extent_native"]
+    g = dict(grid)
+    g["projdef"] = FALSE_ORIGIN.sub("", grid["projdef"]).strip()
+    g["ll_x"] = round(grid["ll_x"] - x0, 3)
+    g["ll_y"] = round(grid["ll_y"] - y0, 3)
+    g["extent_native"] = [round(ex[0] - x0, 3), round(ex[1] - y0, 3),
+                          round(ex[2] - x0, 3), round(ex[3] - y0, 3)]
+    return g
+
+
+def expand(top: dict, r: dict):
+    """Volles, normalisiertes Grid eines gespeicherten Radar-Eintrags (neues UND altes Meta-Format) oder None."""
+    g = {**top, **(r.get("grid") or {})}
+    for k in ("ll_x", "ll_y", "extent_native", "projdef"):
+        if r.get(k) is not None:
+            g[k] = r[k]
+    if not all(k in g for k in ("projdef", "ll_x", "ll_y", "extent_native", "width", "height")):
+        return None
+    return normalize(g)
 
 
 def find_location(f: h5py.File):
@@ -108,7 +145,7 @@ def convert(path: Path):
         "nodata": sn.NODATA_CODE,
         "projdef": projdef,
     }
-    return codes, grid, loc
+    return codes, normalize(grid), loc
 
 
 def download(site: dict, slot: datetime, dest: Path, wait: int) -> None:
@@ -243,8 +280,9 @@ def main() -> None:
         if upd is None:
             if prev is not None:
                 radars[code] = dict(prev)
-                if prev.get("projdef"):
-                    fulls[code] = {**old_shared, **(prev.get("grid") or {}), "projdef": prev["projdef"]}
+                g = expand(old_shared, prev)
+                if g:
+                    fulls[code] = g
             continue
         prev = prev or {}
         entry = {"wmo": s["wmo"]}
@@ -257,8 +295,10 @@ def main() -> None:
         entry["file"] = f"{code}/latest"
         if upd["status"] == "ok":
             fulls[code] = upd["grid"]
-        elif prev.get("projdef"):
-            fulls[code] = {**old_shared, **(prev.get("grid") or {}), "projdef": prev["projdef"]}
+        else:
+            g = expand(old_shared, prev)
+            if g:
+                fulls[code] = g
         radars[code] = entry
     for code, prev in old_radars.items():       # Radare, die nicht (mehr) in sites.json stehen, unveraendert lassen
         if code not in radars:
@@ -270,15 +310,19 @@ def main() -> None:
         if code in fulls:
             ref = {k: fulls[code][k] for k in SHARED_KEYS}
             break
+    for r in radars.values():
+        r.pop("projdef", None)   # steht jetzt einmal oben im grid
+        r.pop("grid", None)
     for code, full in fulls.items():
-        radars[code].pop("grid", None)
-        radars[code]["projdef"] = full["projdef"]
-        shared = {k: full[k] for k in SHARED_KEYS}
-        if shared != ref:
-            print(f"::warning::[{code}] Grid weicht vom gemeinsamen Grid ab, eigener grid-Eintrag")
-            radars[code]["grid"] = shared
-    for code, r in radars.items():
-        r.setdefault("projdef", None)
+        r = radars[code]
+        r["ll_x"], r["ll_y"], r["extent_native"] = full["ll_x"], full["ll_y"], full["extent_native"]
+        diff = {k: full[k] for k in SHARED_KEYS if full[k] != ref[k]}
+        if diff:
+            print(f"::warning::[{code}] weicht vom gemeinsamen Grid ab: {', '.join(diff)}")
+            r["grid"] = diff
+    for r in radars.values():
+        for k in ("ll_x", "ll_y", "extent_native"):
+            r.setdefault(k, None)
 
     meta = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
