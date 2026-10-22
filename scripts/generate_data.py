@@ -42,6 +42,7 @@ import site_native as sn  # liegt im selben Ordner (scripts/)
 BASE_URL = "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z"   # + /<code>/hdf5/filter_simple/
 ELEV = os.environ.get("SITES_ELEV", "05")       # Elevations-Kennung im Dateinamen: 05 = 0.5 Grad
 SLOT_MINUTE_OFFSET = 3                          # Dateien liegen auf Minute 3, 8, 13, ... (jeweils +5)
+GRACE_SECONDS = int(os.environ.get("SITES_GRACE_SECONDS", "30"))   # Nachfrist fuer Nachzuegler, sobald ein Standort fertig geladen hat
 POLL_SECONDS = 10                               # Abstand der Verzeichnis-Abfragen beim Warten
 R2_PREFIX = os.environ.get("SITES_R2_PREFIX", "sites/radar")
 WAIT_SECONDS = int(os.environ.get("SITES_WAIT_SECONDS", "180"))             # wartet auf die Datei
@@ -155,6 +156,9 @@ def convert(path: Path):
     return codes, normalize(grid), loc
 
 
+_first_done: float | None = None   # Zeitpunkt, an dem der erste Standort seine Datei hatte (gilt fuer alle Threads)
+
+
 def list_files(site: dict) -> list[str]:
     """Dateinamen aus dem DWD-Verzeichnis des Standorts (Apache-Index)."""
     url = f"{BASE_URL}/{site['code']}/hdf5/filter_simple/"
@@ -175,8 +179,12 @@ def find_slot_file(site: dict, slot: datetime) -> str | None:
 
 
 def download(site: dict, slot: datetime, dest: Path, wait: int) -> str:
-    """Laedt die Slot-Datei; solange sie im Verzeichnis fehlt, alle POLL_SECONDS erneut, bis `wait` s um sind (dann TimeoutError)."""
-    deadline = time.time() + wait
+    """Laedt die Slot-Datei; solange sie im Verzeichnis fehlt, alle POLL_SECONDS erneut, bis `wait` s um sind (dann TimeoutError).
+
+    Sobald irgendein Standort seine Datei hat, endet das Warten der anderen spaetestens GRACE_SECONDS danach.
+    """
+    global _first_done
+    start = time.time()
     attempt = 0
     label = f"{slot:%H:%M}"
     while True:
@@ -189,6 +197,8 @@ def download(site: dict, slot: datetime, dest: Path, wait: int) -> str:
                     data = r.read()
                 if data:
                     dest.write_bytes(data)
+                    if _first_done is None:
+                        _first_done = time.time()
                     print(f"[{site['code']}] geladen (Versuch {attempt}): {name}")
                     return name
         except urllib.error.HTTPError as e:
@@ -196,6 +206,10 @@ def download(site: dict, slot: datetime, dest: Path, wait: int) -> str:
                 print(f"[{site['code']}] HTTP {e.code}")
         except OSError as e:
             print(f"[{site['code']}] Netzfehler: {e}")
+        # Hat schon ein anderer Standort geliefert, bekommen Nachzuegler nur noch GRACE_SECONDS
+        deadline = start + wait
+        if _first_done is not None:
+            deadline = min(deadline, max(_first_done + GRACE_SECONDS, start + POLL_SECONDS))
         if time.time() > deadline:
             raise TimeoutError(f"Slot {label} fuer {site['code']} nicht verfuegbar")
         time.sleep(POLL_SECONDS)
