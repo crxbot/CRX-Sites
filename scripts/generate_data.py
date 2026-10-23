@@ -43,11 +43,11 @@ import site_native as sn  # liegt im selben Ordner (scripts/)
 BASE_URL = "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z"   # + /<code>/hdf5/filter_simple/
 ELEV = os.environ.get("SITES_ELEV", "05")       # Elevations-Kennung im Dateinamen: 05 = 0.5 Grad
 FILTER = os.environ.get("SITES_FILTER", "filter_polarimetric")   # oder "filter_simple"
-MAX_AGE_MIN = int(os.environ.get("SITES_MAX_AGE_MIN", "20"))   # aelter als das gilt als "nicht verfuegbar"
+MAX_AGE_MIN = int(os.environ.get("SITES_MAX_AGE_MIN", "4"))   # aelter als das gilt als "nicht verfuegbar"
 GRACE_SECONDS = int(os.environ.get("SITES_GRACE_SECONDS", "30"))   # Nachfrist fuer Nachzuegler, sobald ein Standort fertig geladen hat
 POLL_SECONDS = 10                               # Abstand der Verzeichnis-Abfragen beim Warten
 R2_PREFIX = os.environ.get("SITES_R2_PREFIX", "sites/radar")
-WAIT_SECONDS = int(os.environ.get("SITES_WAIT_SECONDS", "180"))             # wartet auf die Datei
+WAIT_SECONDS = int(os.environ.get("SITES_WAIT_SECONDS", "70"))             # wartet auf die Datei
 RETRY_WAIT_SECONDS = int(os.environ.get("SITES_RETRY_WAIT_SECONDS", "20"))  # bei Radaren, die zuletzt nicht ok waren
 MAX_NODATA = float(os.environ.get("SITES_MAX_NODATA", "0.97"))              # Anteil Code 255, ab dem das Bild "invalid" ist
 SITES_FILE = Path(__file__).with_name("sites.json")
