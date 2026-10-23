@@ -3,7 +3,9 @@
 
 R2-Layout:
     sites/radar/metadata.json            (alle Radare: status, timestamp, lat/lon, projdef; Grid einmal)
-    sites/radar/<code>/latest            (gzip, wird pro Lauf ueberschrieben)
+    sites/radar/<code>/latest            (dBZ, gzip, wird pro Lauf ueberschrieben)
+    sites/radial/metadata.json           (Radialgeschwindigkeit: status, timestamp, Decodier-Info, Grid wie radar)
+    sites/radial/<code>/latest           (km/h, gleiches Raster wie dBZ, gzip)
 
 status:  ok           Datei geladen, gewandelt, hochgeladen
          unavailable  DWD hat die Datei nicht geliefert (404 bis Timeout) -> altes Bild + alter timestamp bleiben
@@ -40,13 +42,25 @@ from pyproj import Transformer
 
 import site_native as sn  # liegt im selben Ordner (scripts/)
 
-BASE_URL = "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z"   # + /<code>/hdf5/filter_simple/
+BASE = "https://opendata.dwd.de/weather/radar/sites"   # + /<dir>/<code>/hdf5/<filter>/
+
+# Produkte: Reflektivitaet (wie bisher) und Radialgeschwindigkeit.
+#   prefix     = R2-Ordner (siehe R2_PREFIX / RADIAL_PREFIX), file = Dateiname je Standort
+#   nodata_chk = Anteil-nodata-Pruefung (bei Geschwindigkeit aus: bei Klarluft ist fast alles "kein Echo")
+PRODUCTS = {
+    "dbz":  {"dir": "sweep_vol_z", "name": "dbzh",  "qty": "DBZ",  "unit": "dBZ",
+             "encode": sn.encode_dbz,  "file": "latest", "prefix": "radar",  "nodata_chk": True},
+    "vrad": {"dir": "sweep_vol_v", "name": "vradh", "qty": "VRAD", "unit": "m/s",
+             "encode": sn.encode_vrad, "file": "latest", "prefix": "radial", "nodata_chk": False},
+}
 ELEV = os.environ.get("SITES_ELEV", "05")       # Elevations-Kennung im Dateinamen: 05 = 0.5 Grad
 FILTER = os.environ.get("SITES_FILTER", "filter_polarimetric")   # oder "filter_simple"
 MAX_AGE_MIN = int(os.environ.get("SITES_MAX_AGE_MIN", "4"))   # aelter als das gilt als "nicht verfuegbar"
 GRACE_SECONDS = int(os.environ.get("SITES_GRACE_SECONDS", "30"))   # Nachfrist fuer Nachzuegler, sobald ein Standort fertig geladen hat
 POLL_SECONDS = 10                               # Abstand der Verzeichnis-Abfragen beim Warten
 R2_PREFIX = os.environ.get("SITES_R2_PREFIX", "sites/radar")
+RADIAL_PREFIX = os.environ.get("SITES_RADIAL_PREFIX", "sites/radial")
+PREFIXES = {"radar": R2_PREFIX, "radial": RADIAL_PREFIX}
 WAIT_SECONDS = int(os.environ.get("SITES_WAIT_SECONDS", "70"))             # wartet auf die Datei
 RETRY_WAIT_SECONDS = int(os.environ.get("SITES_RETRY_WAIT_SECONDS", "20"))  # bei Radaren, die zuletzt nicht ok waren
 MAX_NODATA = float(os.environ.get("SITES_MAX_NODATA", "0.97"))              # Anteil Code 255, ab dem das Bild "invalid" ist
@@ -112,11 +126,11 @@ def find_location(f: h5py.File):
     return round(float(sn._x(grp.attrs["lat"])), 5), round(float(sn._x(grp.attrs["lon"])), 5)
 
 
-def convert(path: Path):
+def convert(path: Path, prod: dict):
     """HDF5 -> (uint8-Codes, volles Grid-dict inkl. projdef, (lat, lon)). Logik wie main() in site_native.py."""
     with h5py.File(path, "r") as f:
-        ds = sn.find_dbz_dataset(f)
-        dbz = sn.read_dbz(ds)
+        ds = sn.find_dbz_dataset(f, prod["qty"])
+        dbz = sn.read_dbz(ds, prod["unit"])
         loc = find_location(f)
         polar = sn.find_polar_info(f, ds)
         if polar:
@@ -141,7 +155,7 @@ def convert(path: Path):
             else:
                 ll_x, ll_y = -w * xs / 2, -h * ys / 2
 
-    codes = sn.encode_dbz(dbz)
+    codes = prod["encode"](dbz)
     ll_x, ll_y = round(ll_x, 3), round(ll_y, 3)
     grid = {
         "format": "raw-uint8",
@@ -158,26 +172,26 @@ def convert(path: Path):
     return codes, normalize(grid), loc
 
 
-_first_done: float | None = None   # Zeitpunkt, an dem der erste Standort seine Datei hatte (gilt fuer alle Threads)
+_first_done: dict[str, float] = {}   # je Produkt: Zeitpunkt, an dem der erste Standort seine Datei hatte (gilt fuer alle Threads)
 
 
-def list_files(site: dict) -> list[str]:
+def list_files(site: dict, prod: dict) -> list[str]:
     """Dateinamen aus dem DWD-Verzeichnis des Standorts (Apache-Index)."""
-    url = f"{BASE_URL}/{site['code']}/hdf5/{FILTER}/"
+    url = f"{BASE}/{prod['dir']}/{site['code']}/hdf5/{FILTER}/"
     with urllib.request.urlopen(url, timeout=30) as r:
         html = r.read().decode("utf-8", errors="ignore")
     return re.findall(r'href="([^"/]+-hd5)"', html)
 
 
-def find_latest_file(site: dict) -> tuple[str, datetime] | None:
+def find_latest_file(site: dict, prod: dict) -> tuple[str, datetime] | None:
     """Neueste Datei des Standorts (Name, Zeit aus dem Dateinamen in UTC) oder None."""
     pat = re.compile(
-        rf"ras\d+(?:-stqual)?-vol5minng01_sweeph5onem_dbzh_{ELEV}-(\d{{14}})\d{{2}}"
+        rf"ras\d+(?:-stqual)?-vol5minng01_sweeph5onem_{prod['name']}_{ELEV}-(\d{{14}})\d{{2}}"
         rf"-{re.escape(site['code'])}-{re.escape(site['wmo'])}-hd5$",
         re.IGNORECASE,
     )
     best = None
-    for n in list_files(site):
+    for n in list_files(site, prod):
         m = pat.match(n)
         if m and (best is None or m.group(1) > best[0]):
             best = (m.group(1), n)
@@ -186,19 +200,18 @@ def find_latest_file(site: dict) -> tuple[str, datetime] | None:
     return best[1], datetime.strptime(best[0], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
 
 
-def download(site: dict, newer_than: str | None, dest: Path, wait: int) -> tuple[str, datetime]:
+def download(site: dict, prod: dict, pkey: str, newer_than: str | None, dest: Path, wait: int) -> tuple[str, datetime]:
     """Laedt die neueste Datei, sofern sie juenger als `newer_than` ("%Y%m%d_%H%M") und nicht aelter als MAX_AGE_MIN ist.
 
     Gibt es noch nichts Neues, wird alle POLL_SECONDS erneut gefragt, bis `wait` s um sind (dann TimeoutError).
     Sobald irgendein Standort seine Datei hat, endet das Warten der anderen spaetestens GRACE_SECONDS danach.
     """
-    global _first_done
     start = time.time()
     attempt = 0
     while True:
         attempt += 1
         try:
-            found = find_latest_file(site)
+            found = find_latest_file(site, prod)
             if found:
                 name, ft = found
                 stamp = ft.strftime("%Y%m%d_%H%M")
@@ -206,28 +219,28 @@ def download(site: dict, newer_than: str | None, dest: Path, wait: int) -> tuple
                 if newer_than and stamp <= newer_than:
                     pass                                    # schon veroeffentlicht, auf die naechste warten
                 elif age_min > MAX_AGE_MIN:
-                    print(f"[{site['code']}] neueste Datei {stamp} ist {age_min:.0f} min alt (> {MAX_AGE_MIN})")
+                    print(f"[{site['code']}/{pkey}] neueste Datei {stamp} ist {age_min:.0f} min alt (> {MAX_AGE_MIN})")
                 else:
-                    url = f"{BASE_URL}/{site['code']}/hdf5/{FILTER}/{name}"
+                    url = f"{BASE}/{prod['dir']}/{site['code']}/hdf5/{FILTER}/{name}"
                     with urllib.request.urlopen(url, timeout=30) as r:
                         data = r.read()
                     if data:
                         dest.write_bytes(data)
-                        if _first_done is None:
-                            _first_done = time.time()
-                        print(f"[{site['code']}] geladen (Versuch {attempt}): {name}")
+                        _first_done.setdefault(pkey, time.time())
+                        print(f"[{site['code']}/{pkey}] geladen (Versuch {attempt}): {name}")
                         return name, ft
         except urllib.error.HTTPError as e:
             if e.code != 404:
-                print(f"[{site['code']}] HTTP {e.code}")
+                print(f"[{site['code']}/{pkey}] HTTP {e.code}")
         except OSError as e:
-            print(f"[{site['code']}] Netzfehler: {e}")
+            print(f"[{site['code']}/{pkey}] Netzfehler: {e}")
         # Hat schon ein anderer Standort geliefert, bekommen Nachzuegler nur noch GRACE_SECONDS
         deadline = start + wait
-        if _first_done is not None:
-            deadline = min(deadline, max(_first_done + GRACE_SECONDS, start + POLL_SECONDS))
+        fd = _first_done.get(pkey)
+        if fd is not None:
+            deadline = min(deadline, max(fd + GRACE_SECONDS, start + POLL_SECONDS))
         if time.time() > deadline:
-            raise TimeoutError(f"keine neue Datei fuer {site['code']}")
+            raise TimeoutError(f"keine neue Datei fuer {site['code']}/{pkey}")
         time.sleep(POLL_SECONDS)
 
 
@@ -243,37 +256,39 @@ def get_json(s3, bucket: str, key: str) -> dict:
         return {}
 
 
-def process_site(s3, bucket: str, site: dict, prev_ts: str | None, wait: int) -> dict:
+def process_site(s3, bucket: str, site: dict, pkey: str, prev_ts: str | None, wait: int) -> dict:
     """Update fuer den Meta-Eintrag: {"status": ...} bzw. bei ok zusaetzlich timestamp, lat, lon, grid."""
     code = site["code"]
+    prod = PRODUCTS[pkey]
+    tag = f"{code}/{pkey}"
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "in.hd5"
-            _name, file_time = download(site, prev_ts, src, wait)
+            _name, file_time = download(site, prod, pkey, prev_ts, src, wait)
             ts = file_time.strftime("%Y%m%d_%H%M")       # Zeit aus dem Dateinamen
-            codes, grid, (lat, lon) = convert(src)
+            codes, grid, (lat, lon) = convert(src, prod)
     except TimeoutError as e:
-        print(f"[{code}] unavailable: {e}")
+        print(f"[{tag}] unavailable: {e}")
         return {"status": "unavailable"}
     except Exception as e:
-        print(f"[{code}] invalid (Lesefehler): {e}")
+        print(f"[{tag}] invalid (Lesefehler): {e}")
         return {"status": "invalid"}
 
     nodata_share = float((codes == sn.NODATA_CODE).mean())
-    print(f"[{code}] Anteil nodata: {nodata_share:.1%}")
-    if nodata_share > MAX_NODATA:
-        print(f"[{code}] invalid: {nodata_share:.1%} > {MAX_NODATA:.0%} nodata")
+    print(f"[{tag}] Anteil nodata: {nodata_share:.1%}")
+    if prod["nodata_chk"] and nodata_share > MAX_NODATA:
+        print(f"[{tag}] invalid: {nodata_share:.1%} > {MAX_NODATA:.0%} nodata")
         return {"status": "invalid"}
 
     s3.put_object(
         Bucket=bucket,
-        Key=f"{R2_PREFIX}/{code}/latest",
+        Key=f"{PREFIXES[prod['prefix']]}/{code}/{prod['file']}",
         Body=gzip.compress(codes.tobytes(), 9, mtime=0),
         ContentType="application/gzip",
         CacheControl=CACHE,
     )
-    print(f"[{code}] OK {ts}")
+    print(f"[{tag}] OK {ts}")
     return {
         "status": "ok",
         "timestamp": ts,
@@ -308,23 +323,27 @@ def main() -> None:
     old_meta = get_json(s3, bucket, meta_key)
     old_radars = old_meta.get("radars", {})
     old_shared = old_meta.get("grid") or {}
+    radial_key = f"{RADIAL_PREFIX}/metadata.json"
+    old_radial = get_json(s3, bucket, radial_key).get("radars", {})
 
-    updates: dict[str, dict] = {}
+    updates: dict[str, dict] = {}    # dbz
+    vupdates: dict[str, dict] = {}   # vrad
     errors = []
-    with ThreadPoolExecutor(max_workers=len(run_sites) or 1) as pool:
+    with ThreadPoolExecutor(max_workers=(len(run_sites) * len(PRODUCTS)) or 1) as pool:
         futs = {}
         for s in run_sites:
-            prev = old_radars.get(s["code"], {})
-            # Radar war zuletzt schon gestoert -> nicht wieder 3 Minuten warten
-            wait = WAIT_SECONDS if prev.get("status", "ok") == "ok" else RETRY_WAIT_SECONDS
-            futs[pool.submit(process_site, s3, bucket, s, prev.get("timestamp"), wait)] = s["code"]
+            for pkey in PRODUCTS:
+                prev = (old_radars if pkey == "dbz" else old_radial).get(s["code"], {})
+                # Radar war zuletzt schon gestoert -> nicht wieder 3 Minuten warten
+                wait = WAIT_SECONDS if prev.get("status", "ok") == "ok" else RETRY_WAIT_SECONDS
+                futs[pool.submit(process_site, s3, bucket, s, pkey, prev.get("timestamp"), wait)] = (s["code"], pkey)
         for fut in as_completed(futs):
-            code = futs[fut]
+            code, pkey = futs[fut]
             try:
-                updates[code] = fut.result()
+                (updates if pkey == "dbz" else vupdates)[code] = fut.result()
             except Exception as e:  # z.B. R2-Upload fehlgeschlagen: Eintrag unveraendert lassen
-                print(f"[{code}] FEHLER: {e}")
-                errors.append(code)
+                print(f"[{code}/{pkey}] FEHLER: {e}")
+                errors.append(f"{code}/{pkey}")
 
     # --- Eintraege + volle Grids je Radar zusammenbauen (alt + neu) ---
     radars: dict[str, dict] = {}
@@ -393,8 +412,48 @@ def main() -> None:
         CacheControl=CACHE,
     )
 
+    # --- Radialgeschwindigkeit: eigene metadata.json unter sites/radial (Grid-Angaben identisch zu radar) ---
+    rradars: dict[str, dict] = {}
+    for s in sites:
+        code = s["code"]
+        v = vupdates.get(code)
+        old_v = old_radial.get(code)
+        if v is None:
+            if old_v is not None:
+                rradars[code] = old_v
+            continue
+        old_v = old_v or {}
+        base = radars.get(code, {})
+        rradars[code] = {
+            "wmo": s["wmo"],
+            **({"name": s["name"]} if s.get("name") else {}),
+            "status": v["status"],
+            "timestamp": first(v.get("timestamp"), old_v.get("timestamp")),
+            "lat": base.get("lat"), "lon": base.get("lon"),
+            "file": f"{code}/latest",
+            "ll_x": base.get("ll_x"), "ll_y": base.get("ll_y"), "extent_native": base.get("extent_native"),
+        }
+    for code, prev in old_radial.items():       # nicht mehr in sites.json: unveraendert lassen
+        rradars.setdefault(code, prev)
+    rmeta = {
+        "generated_at": meta["generated_at"],
+        "unit": "km/h",   # Decodieren im Client: kmh = (code - zero_code) * step_kmh; 0 und 255 transparent
+        "step_kmh": sn.VRAD_STEP_KMH, "zero_code": sn.VRAD_ZERO_CODE,
+        "min_code": 1, "max_code": sn.VRAD_ZERO_CODE + sn.VRAD_MAX_STEPS,
+        "nodata": [0, sn.NODATA_CODE],
+        "grid": meta["grid"],
+        "radars": rradars,
+    }
+    s3.put_object(
+        Bucket=bucket, Key=radial_key,
+        Body=json.dumps(rmeta, indent=2, ensure_ascii=False).encode("utf-8"),
+        ContentType="application/json",
+        CacheControl=CACHE,
+    )
+
     print("metadata.json geschrieben: " + ", ".join(f"{c}={v.get('status')}" for c, v in radars.items()))
     bad = [c for c, v in radars.items() if v.get("status") != "ok"]
+    bad += [f"{c}/vrad" for c, v in rradars.items() if v.get("status") != "ok"]
     if bad:
         print(f"::warning::Radare nicht ok: {', '.join(bad)}")
     if errors:

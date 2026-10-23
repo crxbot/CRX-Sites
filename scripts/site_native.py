@@ -79,8 +79,8 @@ def _x(v):
     return v.item() if isinstance(v, np.ndarray) and v.size == 1 else v
 
 
-def find_dbz_dataset(f: h5py.File) -> h5py.Dataset:
-    """Waehlt die Draufsicht (top_view / product MAX): das groesste DBZ-Dataset.
+def find_dbz_dataset(f: h5py.File, quantity: str = "DBZ") -> h5py.Dataset:
+    """Waehlt das groesste 2D-Dataset der Groesse `quantity` ("DBZ" oder "VRAD"; Praefix-Vergleich, also DBZH/VRADH ok).
 
     Die Datei enthaelt mehrere Ansichten (z.B. 400x12 Seitenansichten und 400x400 Draufsicht).
     """
@@ -89,13 +89,13 @@ def find_dbz_dataset(f: h5py.File) -> h5py.Dataset:
     def visitor(name, obj):
         if isinstance(obj, h5py.Dataset) and name.endswith("/data") and obj.ndim == 2:
             what = obj.parent.get("what")
-            q = _s(what.attrs["quantity"]).upper() if what is not None and "quantity" in what.attrs else "DBZ"
-            if q.startswith("DBZ"):
+            q = _s(what.attrs["quantity"]).upper() if what is not None and "quantity" in what.attrs else quantity
+            if q.startswith(quantity):
                 cands.append(obj)
 
     f.visititems(visitor)
     if not cands:
-        raise RuntimeError("Kein 2D-DBZ-Datensatz gefunden.")
+        raise RuntimeError(f"Kein 2D-{quantity}-Datensatz gefunden.")
 
     def score(ds):
         top = 0
@@ -109,8 +109,8 @@ def find_dbz_dataset(f: h5py.File) -> h5py.Dataset:
     return best
 
 
-def read_dbz(ds: h5py.Dataset) -> np.ndarray:
-    """dBZ als float64, NaN = kein Datum, -inf = undetect."""
+def read_dbz(ds: h5py.Dataset, unit: str = "dBZ") -> np.ndarray:
+    """Physikalischer Wert (dBZ bzw. m/s bei VRADH) als float64, NaN = kein Datum, -inf = undetect."""
     what = None
     for grp in (ds.parent, ds.parent.parent, ds.file):
         w = grp.get("what")
@@ -135,7 +135,7 @@ def read_dbz(ds: h5py.Dataset) -> np.ndarray:
           f"nodata={nodata}, undetect={undetect}")
     valid = dbz[np.isfinite(dbz)]
     if valid.size:
-        print(f"Wertebereich: {valid.min():.1f} .. {valid.max():.1f} dBZ")
+        print(f"Wertebereich: {valid.min():.1f} .. {valid.max():.1f} {unit}")
     return dbz
 
 
@@ -249,6 +249,25 @@ def encode_dbz(dbz: np.ndarray) -> np.ndarray:
     ok = np.isfinite(dbz) & (dbz >= DBZ_MIN)
     k = np.round((dbz[ok] - DBZ_MIN) / DBZ_STEP) + 1
     codes[ok] = np.clip(k, 1, MAX_CODE).astype(np.uint8)
+    return codes
+
+
+# Radialgeschwindigkeit (VRADH): Quelle m/s, Ausgabe km/h in 3.6-km/h-Schritten (= 1 m/s), +-115.2 km/h
+#   0        kein Echo (undetect)              -> transparent
+#   1 .. 65  km/h = (code - 33) * 3.6          (-115.2 .. 0 .. +115.2)
+#   255      kein Daten / ausserhalb           -> transparent
+# Vorzeichen wie ODIM: negativ = auf das Radar zu, positiv = vom Radar weg.
+VRAD_STEP_KMH = 3.6
+VRAD_ZERO_CODE = 33
+VRAD_MAX_STEPS = 32     # 32 * 3.6 = 115.2 km/h
+
+
+def encode_vrad(v_ms: np.ndarray) -> np.ndarray:
+    codes = np.zeros(v_ms.shape, dtype=np.uint8)          # 0 = kein Echo
+    codes[np.isnan(v_ms)] = NODATA_CODE
+    ok = np.isfinite(v_ms)
+    steps = np.clip(np.round(v_ms[ok] * 3.6 / VRAD_STEP_KMH), -VRAD_MAX_STEPS, VRAD_MAX_STEPS)
+    codes[ok] = (steps + VRAD_ZERO_CODE).astype(np.uint8)
     return codes
 
 
